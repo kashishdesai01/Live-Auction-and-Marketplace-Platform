@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
-import { getAccessToken } from '@/lib/api';
+import api, { getAccessToken } from '@/lib/api';
 
 interface Bid {
   bidder_name: string;
@@ -22,8 +22,9 @@ interface AuctionState {
 
   connect: (auctionId: string, initialPrice: number, endTime: string) => void;
   disconnect: () => void;
-  placeBid: (amount: number) => void;
+  placeBid: (amount: number) => Promise<boolean>;
   clearRejectReason: () => void;
+  setRejectReason: (reason: string | null) => void;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:5001';
@@ -84,26 +85,33 @@ export const useAuctionStore = create<AuctionState>((set, get) => ({
 
   placeBid: async (amount) => {
     const { auctionId } = get();
-    if (!auctionId) return;
+    if (!auctionId) return false;
     
+    const previousPrice = get().currentPrice;
     set({ lastRejectReason: null });
+    // Optimistic UI update so the current bid changes instantly.
+    set({ currentPrice: amount });
 
     try {
-        const token = getAccessToken();
-        const res = await fetch(`http://localhost:5001/api/auctions/${auctionId}/bid`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ amount, idempotency_key: crypto.randomUUID() })
-        });
-        
-        const data = await res.json();
-        if (!res.ok) {
-            set({ lastRejectReason: data.error?.reason || data.error?.message || 'Bid rejected' });
-        }
-    } catch (err) {
-        set({ lastRejectReason: 'Network error placing bid' });
+      const { data } = await api.post(`/auctions/${auctionId}/bid`, {
+        amount,
+        idempotency_key: crypto.randomUUID(),
+      });
+      const confirmedPrice = data?.new_price !== undefined ? Number(data.new_price) : amount;
+      set({ currentPrice: confirmedPrice, lastRejectReason: null });
+      return true;
+    } catch (err: any) {
+      const reason =
+        err?.response?.data?.error?.reason ||
+        err?.response?.data?.error?.message ||
+        err?.response?.data?.error?.code ||
+        'Network error placing bid';
+      // Revert optimistic price on reject/failure.
+      set({ currentPrice: previousPrice, lastRejectReason: String(reason) });
+      return false;
     }
   },
 
   clearRejectReason: () => set({ lastRejectReason: null }),
+  setRejectReason: (reason) => set({ lastRejectReason: reason }),
 }));

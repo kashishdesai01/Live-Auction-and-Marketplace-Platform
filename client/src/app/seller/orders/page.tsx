@@ -30,8 +30,8 @@ export default function SellerOrdersPage() {
       setShippingModal({ open: false, orderId: null });
       setTrackingNumber('');
       refetch();
-    } catch (err) {
-      alert('Failed to update shipping status');
+    } catch (err: any) {
+      alert(err?.response?.data?.error?.message || 'Failed to update shipping status');
     } finally {
       setShippingLoading(false);
     }
@@ -118,7 +118,9 @@ export default function SellerOrdersPage() {
                   </td>
                 </tr>
               ) : (
-                filteredOrders.map((order: any) => (
+                filteredOrders.map((order: any) => {
+                  const paymentStatus = order.status || order.payment_status;
+                  return (
                   <tr key={order.id} className="hover:bg-white/5 transition-colors group">
                     <td className="px-6 py-4 max-w-xs">
                       <div className="flex items-center gap-4">
@@ -154,6 +156,17 @@ export default function SellerOrdersPage() {
                     </td>
 
                     <td className="px-6 py-4">
+                      <div className="mb-1">
+                        {paymentStatus === 'paid' ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            Payment Confirmed
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                            Awaiting Payment
+                          </span>
+                        )}
+                      </div>
                       {order.shipping_status === 'pending' ? (
                         <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
                           <Truck className="w-3.5 h-3.5" /> Needs Shipping
@@ -172,7 +185,14 @@ export default function SellerOrdersPage() {
                     </td>
 
                     <td className="px-6 py-4 text-right">
-                      {order.shipping_status === 'pending' ? (
+                      {paymentStatus !== 'paid' ? (
+                        <button
+                          disabled
+                          className="px-4 py-2 glass-card text-xs font-medium rounded-lg inline-block whitespace-nowrap opacity-50 cursor-not-allowed"
+                        >
+                          Awaiting Payment
+                        </button>
+                      ) : order.shipping_status === 'pending' ? (
                         <button 
                           onClick={() => setShippingModal({ open: true, orderId: order.id })}
                           className="px-4 py-2 bg-primary/20 text-primary hover:bg-primary hover:text-primary-foreground text-xs font-medium rounded-lg transition-colors inline-block whitespace-nowrap"
@@ -186,7 +206,8 @@ export default function SellerOrdersPage() {
                       )}
                     </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>

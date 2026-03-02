@@ -6,6 +6,7 @@ const { validate } = require('../middleware/validate');
 const itemService = require('../services/itemService');
 const auctionService = require('../services/auctionService');
 const pool = require('../config/db');
+const { getOrderSchema } = require('../services/orderSchema');
 
 const sellerAuth = [authenticate, requireRole('seller')];
 
@@ -222,13 +223,30 @@ router.patch('/orders/:id/ship', sellerAuth, [
   validate,
 ], async (req, res, next) => {
   try {
-    const pool = require('../config/db');
+    const { statusColumn } = await getOrderSchema();
     const { rows } = await pool.query(
       `UPDATE orders SET shipping_status='shipped', tracking_number=$1
-       WHERE id=$2 AND seller_id=$3 RETURNING *`,
+       WHERE id=$2 AND seller_id=$3 AND ${statusColumn}='paid'
+       RETURNING *`,
       [req.body.tracking_number, req.params.id, req.user.sub]
     );
-    if (!rows[0]) throw { isOperational: true, statusCode: 404, code: 'NOT_FOUND', message: 'Order not found' };
+    if (!rows[0]) {
+      const { rows: existing } = await pool.query(
+        `SELECT id, ${statusColumn} as payment_status
+         FROM orders
+         WHERE id=$1 AND seller_id=$2`,
+        [req.params.id, req.user.sub]
+      );
+      if (!existing[0]) {
+        throw { isOperational: true, statusCode: 404, code: 'NOT_FOUND', message: 'Order not found' };
+      }
+      throw {
+        isOperational: true,
+        statusCode: 400,
+        code: 'ORDER_UNPAID',
+        message: 'Order must be paid before marking shipped.',
+      };
+    }
     
     // Notify buyer
     const notificationService = require('../services/notificationService');

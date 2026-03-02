@@ -5,6 +5,7 @@ const feedService = require('../services/feedService');
 const categoryService = require('../services/categoryService');
 const notificationService = require('../services/notificationService');
 const pool = require('../config/db');
+const { getOrderSchema } = require('../services/orderSchema');
 
 const buyerAuth = [authenticate, requireRole('buyer')];
 
@@ -21,6 +22,19 @@ router.get('/feed', optionalAuth, async (req, res, next) => {
 
 // ---- Stripe Payment Vaulting ----
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_test_12345');
+
+function isStripeConfigured() {
+  const key = (process.env.STRIPE_SECRET_KEY || '').trim();
+  if (!key) return false;
+  if (key === 'sk_test_dummy' || key === 'sk_test_12345' || key.includes('...')) return false;
+  return true;
+}
+
+const SANDBOX_SCENARIOS = {
+  success: 'pm_card_visa',
+  decline: 'pm_card_chargeDeclined',
+  auth: 'pm_card_authenticationRequired',
+};
 
 // POST /api/buyer/stripe/setup -- Generate a SetupIntent client_secret to vault a card
 router.post('/stripe/setup', buyerAuth, async (req, res, next) => {
@@ -100,7 +114,7 @@ router.put('/profile', buyerAuth, async (req, res, next) => {
 router.get('/watchlist', buyerAuth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT w.*, a.current_price, a.end_time, a.status as auction_status,
+      `SELECT w.*, a.id, a.current_price, a.end_time, a.status as auction_status,
               i.title as item_title, i.image_urls[1] as item_image,
               (SELECT COUNT(*) FROM bids b WHERE b.auction_id=a.id) as bid_count
        FROM watchlist w
@@ -174,6 +188,238 @@ router.get('/wins', buyerAuth, async (req, res, next) => {
     );
     res.json({ wins: rows });
   } catch (err) { next(err); }
+});
+
+// POST /api/buyer/orders/:id/pay
+// Manual fallback payment path for pending/failed orders.
+router.post('/orders/:id/pay', buyerAuth, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { statusColumn, hasStripePaymentIntentId } = await getOrderSchema(client);
+
+    const { rows: orderRows } = await client.query(
+      `SELECT o.*, a.item_id
+       FROM orders o
+       JOIN auctions a ON a.id = o.auction_id
+       WHERE o.id = $1 AND o.buyer_id = $2
+       FOR UPDATE`,
+      [req.params.id, req.user.sub]
+    );
+    const order = orderRows[0];
+    if (!order) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+
+    const currentStatus = order[statusColumn];
+    if (currentStatus === 'paid') {
+      await client.query('COMMIT');
+      return res.json({ order, paid: true, mode: 'already_paid' });
+    }
+    if (!['pending', 'failed'].includes(currentStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: { code: 'INVALID_STATE', message: 'Order cannot be paid in current state.' } });
+    }
+
+    const requestedMode = String(req.query.mode || '').toLowerCase();
+    const mode = requestedMode || (isStripeConfigured() ? 'sandbox' : 'demo');
+    const scenario = String(req.query.scenario || 'success').toLowerCase();
+    const hasWebhookSecret = Boolean((process.env.STRIPE_WEBHOOK_SECRET || '').trim());
+
+    if (!['sandbox', 'vaulted', 'demo'].includes(mode)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: {
+          code: 'INVALID_MODE',
+          message: 'Unsupported payment mode. Use sandbox, vaulted, or demo.',
+        },
+      });
+    }
+
+    if (mode === 'sandbox' && !SANDBOX_SCENARIOS[scenario]) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: {
+          code: 'INVALID_SCENARIO',
+          message: 'Unsupported sandbox scenario. Use success, decline, or auth.',
+        },
+      });
+    }
+
+    if (mode !== 'demo' && !isStripeConfigured()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: {
+          code: 'STRIPE_NOT_CONFIGURED',
+          message: 'Stripe is not configured. Add STRIPE_SECRET_KEY or use mode=demo.',
+        },
+      });
+    }
+
+    const updateOrderState = async (nextStatus, paymentIntentId = null) => {
+      const updateParams = [nextStatus, order.id];
+      const updateClauses = [`${statusColumn} = $1`];
+      if (hasStripePaymentIntentId && paymentIntentId) {
+        updateParams.push(paymentIntentId);
+        updateClauses.push(`stripe_payment_intent_id = $3`);
+      }
+      const { rows: updatedRows } = await client.query(
+        `UPDATE orders
+         SET ${updateClauses.join(', ')}
+         WHERE id = $2
+         RETURNING *`,
+        updateParams
+      );
+      return updatedRows[0];
+    };
+
+    if (mode === 'demo') {
+      const updatedOrder = await updateOrderState('paid');
+      await client.query('COMMIT');
+      return res.json({ order: updatedOrder, paid: true, mode: 'demo' });
+    }
+
+    const amountCents = Math.round(Number(order.amount) * 100);
+    const { rows: sellerRows } = await client.query(
+      'SELECT stripe_account_id FROM seller_profiles WHERE user_id = $1',
+      [order.seller_id]
+    );
+    const sellerAccountId = sellerRows[0]?.stripe_account_id;
+
+    if (mode === 'sandbox') {
+      const intentPayload = {
+        amount: amountCents,
+        currency: 'usd',
+        confirm: true,
+        payment_method: SANDBOX_SCENARIOS[scenario],
+        metadata: {
+          order_id: order.id,
+          auction_id: order.auction_id,
+          item_id: order.item_id,
+          buyer_id: req.user.sub,
+          seller_id: order.seller_id,
+          scenario,
+        },
+      };
+
+      if (sellerAccountId) {
+        intentPayload.transfer_data = { destination: sellerAccountId };
+        intentPayload.application_fee_amount = Math.round(amountCents * 0.05);
+      }
+
+      try {
+        const paymentIntent = await stripe.paymentIntents.create(intentPayload);
+        const nextStatus = paymentIntent.status === 'succeeded' && !hasWebhookSecret ? 'paid' : 'pending';
+        const updatedOrder = await updateOrderState(nextStatus, paymentIntent.id);
+        await client.query('COMMIT');
+        return res.json({
+          order: updatedOrder,
+          paid: nextStatus === 'paid',
+          mode: 'sandbox',
+          scenario,
+          webhook_expected: hasWebhookSecret,
+          payment_intent_status: paymentIntent.status,
+        });
+      } catch (payErr) {
+        const piId = payErr?.raw?.payment_intent?.id || payErr?.payment_intent?.id || null;
+        const isAuthRequired =
+          payErr?.code === 'authentication_required' ||
+          payErr?.raw?.code === 'authentication_required' ||
+          payErr?.raw?.payment_intent?.status === 'requires_action';
+        const nextStatus = isAuthRequired ? 'pending' : 'failed';
+        const updatedOrder = await updateOrderState(nextStatus, piId);
+        await client.query('COMMIT');
+        return res.status(isAuthRequired ? 202 : 402).json({
+          error: {
+            code: isAuthRequired ? 'AUTHENTICATION_REQUIRED' : 'PAYMENT_FAILED',
+            message: payErr.message || (isAuthRequired ? 'Authentication required to complete payment.' : 'Payment failed'),
+          },
+          order: updatedOrder,
+          paid: false,
+          mode: 'sandbox',
+          scenario,
+          payment_intent_status: payErr?.raw?.payment_intent?.status || 'failed',
+        });
+      }
+    }
+
+    const { rows: buyerRows } = await client.query(
+      'SELECT stripe_customer_id FROM buyer_profiles WHERE user_id = $1',
+      [req.user.sub]
+    );
+    const buyerCustomerId = buyerRows[0]?.stripe_customer_id;
+    if (!buyerCustomerId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: {
+          code: 'PAYMENT_METHOD_REQUIRED',
+          message: 'No saved payment method found. Add a card before paying.',
+        },
+      });
+    }
+
+    const pms = await stripe.paymentMethods.list({ customer: buyerCustomerId, type: 'card' });
+    const paymentMethod = pms.data[0]?.id;
+    if (!paymentMethod) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: {
+          code: 'PAYMENT_METHOD_REQUIRED',
+          message: 'No saved card available. Please set up a card first.',
+        },
+      });
+    }
+
+    const intentPayload = {
+      amount: amountCents,
+      currency: 'usd',
+      customer: buyerCustomerId,
+      payment_method: paymentMethod,
+      off_session: true,
+      confirm: true,
+      metadata: {
+        order_id: order.id,
+        auction_id: order.auction_id,
+        item_id: order.item_id,
+        buyer_id: req.user.sub,
+        seller_id: order.seller_id,
+      },
+    };
+
+    if (sellerAccountId) {
+      intentPayload.transfer_data = { destination: sellerAccountId };
+      intentPayload.application_fee_amount = Math.round(amountCents * 0.05);
+    }
+
+    let paymentIntent;
+    try {
+      paymentIntent = await stripe.paymentIntents.create(intentPayload);
+    } catch (payErr) {
+      const updatedOrder = await updateOrderState('failed', payErr?.raw?.payment_intent?.id || null);
+      await client.query('COMMIT');
+      return res.status(402).json({
+        error: { code: 'PAYMENT_FAILED', message: payErr.message || 'Payment failed' },
+        order: updatedOrder,
+      });
+    }
+
+    const nextStatus = paymentIntent.status === 'succeeded' && !hasWebhookSecret ? 'paid' : 'pending';
+    const updatedOrder = await updateOrderState(nextStatus, paymentIntent.id);
+    await client.query('COMMIT');
+    return res.json({
+      order: updatedOrder,
+      paid: nextStatus === 'paid',
+      mode: 'vaulted',
+      webhook_expected: hasWebhookSecret,
+      payment_intent_status: paymentIntent.status,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
 });
 
 // GET /api/buyer/notifications

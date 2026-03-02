@@ -1,12 +1,13 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { useAuctionStore } from '@/stores/auctionStore';
 import { useAuth } from '@/contexts/AuthContext';
 import { CountdownTimer } from './CountdownTimer';
 import { SetupCardModal } from './SetupCardModal';
 import { cn } from '@/lib/utils';
-import { TrendingUp, Users, Wifi, WifiOff, ChevronUp } from 'lucide-react';
+import { Users, Wifi, WifiOff, ChevronUp } from 'lucide-react';
 import api from '@/lib/api';
 
 interface LiveBidPanelProps {
@@ -19,19 +20,25 @@ interface LiveBidPanelProps {
 }
 
 export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, sellerId, status }: LiveBidPanelProps) {
-  const { user, isAuthenticated, mutateAuth } = useAuth();
-  const { connect, disconnect, placeBid, clearRejectReason, currentPrice, bids, viewerCount, isConnected, lastRejectReason, isAuctionEnded, winner } = useAuctionStore();
+  const router = useRouter();
+  const { user, isAuthenticated, mutateAuth, switchRole } = useAuth();
+  const { connect, disconnect, placeBid, clearRejectReason, setRejectReason, currentPrice, bids, viewerCount, isConnected, lastRejectReason, isAuctionEnded, winner } = useAuctionStore();
   const [bidAmount, setBidAmount] = useState('');
+  const [isPlacingBid, setIsPlacingBid] = useState(false);
   const [priceFlash, setPriceFlash] = useState(false);
   const prevPrice = useRef(initialPrice);
   const bidsEndRef = useRef<HTMLDivElement>(null);
   
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [clientSecret, setClientSecret] = useState<string | null>(null);
+  const [bypassSetup, setBypassSetup] = useState(false);
+  const [isSwitchingRole, setIsSwitchingRole] = useState(false);
+  const stripeEnabled = Boolean(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY);
 
   const isBuyer = user?.roles?.includes('buyer');
   const isSeller = user?.id === sellerId;
-  const requiresSetup = isBuyer && !(user as any)?.has_payment_method;
+  const canSwitchToBuyer = Boolean(user?.roles?.includes('buyer') && user?.active_role !== 'buyer');
+  const requiresSetup = Boolean(isBuyer && stripeEnabled && !bypassSetup && !(user as any)?.has_payment_method);
 
   useEffect(() => {
     connect(auctionId, initialPrice, endTime);
@@ -55,32 +62,62 @@ export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, s
 
   const handlePaymentSetup = async () => {
     setShowSetupModal(true);
+    setClientSecret(null);
     try {
       const { data } = await api.post('/buyer/stripe/setup');
       setClientSecret(data.client_secret);
     } catch (err) {
       console.error(err);
       setShowSetupModal(false);
+      setBypassSetup(true);
+      setRejectReason('Card setup unavailable in this environment. Try bidding again.');
     }
   };
 
-  const handleBid = () => {
+  const submitBid = async (amount: number) => {
+    setIsPlacingBid(true);
+    const ok = await placeBid(amount);
+    setIsPlacingBid(false);
+    if (ok) {
+      // Refresh server-rendered bid history/details after confirmed bid.
+      router.refresh();
+    }
+  };
+
+  const handleBid = async () => {
     if (requiresSetup) {
       handlePaymentSetup();
       return;
     }
-    const amount = parseFloat(bidAmount);
-    if (isNaN(amount) || amount < minBid) return;
-    placeBid(amount);
+
+    const raw = bidAmount.trim();
+    let cleaned = raw.replace(/\s+/g, '').replace(/\$/g, '');
+    if (cleaned.includes(',') && !cleaned.includes('.')) {
+      cleaned = cleaned.replace(',', '.');
+    }
+    cleaned = cleaned.replace(/,/g, '');
+
+    const parsed = raw === '' ? minBid : Number(cleaned);
+    if (!Number.isFinite(parsed)) {
+      setRejectReason('Enter a valid bid amount');
+      return;
+    }
+
+    const amount = Number(parsed.toFixed(2));
+    if (amount < minBid) {
+      setRejectReason('too_low');
+      return;
+    }
+    await submitBid(amount);
     setBidAmount('');
   };
 
-  const quickBid = (extra: number) => {
+  const quickBid = async (extra: number) => {
     if (requiresSetup) {
       handlePaymentSetup();
       return;
     }
-    placeBid(currentPrice + extra);
+    await submitBid(Number((currentPrice + extra).toFixed(2)));
   };
 
   return (
@@ -144,6 +181,8 @@ export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, s
                 {lastRejectReason === 'ended' && 'Auction has ended'}
                 {lastRejectReason === 'own_bid' && 'You cannot bid on your own item'}
                 {lastRejectReason === 'duplicate' && 'Duplicate bid'}
+                {lastRejectReason === 'already_highest' && 'You are already the highest bidder. Wait until someone outbids you.'}
+                {!['too_low', 'ended', 'own_bid', 'duplicate', 'already_highest'].includes(lastRejectReason) && lastRejectReason}
               </span>
               <button onClick={clearRejectReason} className="ml-2 font-bold">✕</button>
             </div>
@@ -155,6 +194,7 @@ export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, s
               <button
                 key={extra}
                 onClick={() => quickBid(extra)}
+                disabled={isPlacingBid}
                 className="text-xs py-2 rounded-lg bg-white/5 hover:bg-primary/20 hover:text-primary border border-white/10 hover:border-primary/30 transition-all font-medium"
               >
                 +${extra.toFixed(0)}
@@ -167,21 +207,22 @@ export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, s
             <div className="relative flex-1">
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground font-medium">$</span>
               <input
-                type="number"
+                type="text"
+                inputMode="decimal"
                 value={bidAmount}
                 onChange={(e) => setBidAmount(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleBid()}
-                placeholder={minBid.toFixed(2)}
-                min={minBid}
-                step={bidIncrement}
+                placeholder={`${minBid.toFixed(2)} (min)`}
+                disabled={isPlacingBid}
                 className="w-full pl-7 pr-3 py-2.5 bg-white/5 border border-white/10 rounded-lg text-sm focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/25"
               />
             </div>
             <button
               onClick={handleBid}
+              disabled={isPlacingBid}
               className="px-5 py-2.5 bg-primary text-primary-foreground rounded-lg font-semibold text-sm hover:bg-primary/90 transition-colors flex items-center gap-1.5"
             >
-              <ChevronUp className="w-4 h-4" /> Bid
+              <ChevronUp className="w-4 h-4" /> {isPlacingBid ? 'Bidding...' : 'Bid'}
             </button>
           </div>
           <p className="text-xs text-muted-foreground text-center">Minimum bid: ${minBid.toFixed(2)}</p>
@@ -195,6 +236,43 @@ export function LiveBidPanel({ auctionId, initialPrice, endTime, bidIncrement, s
           <a href="/login" className="inline-block px-6 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors">
             Log in to Bid
           </a>
+        </div>
+      )}
+
+      {/* Own auction */}
+      {!isAuctionEnded && status === 'live' && isAuthenticated && isSeller && (
+        <div className="px-5 py-4 text-center border-b border-white/10">
+          <p className="text-sm text-muted-foreground">
+            You are the seller of this item. Sellers cannot bid on their own auction.
+          </p>
+        </div>
+      )}
+
+      {/* Wrong role */}
+      {!isAuctionEnded && status === 'live' && isAuthenticated && !isSeller && !isBuyer && (
+        <div className="px-5 py-4 text-center border-b border-white/10">
+          <p className="text-sm text-muted-foreground mb-3">Switch to Buyer role to place bids.</p>
+          {canSwitchToBuyer ? (
+            <button
+              disabled={isSwitchingRole}
+              onClick={async () => {
+                try {
+                  setIsSwitchingRole(true);
+                  await switchRole('buyer');
+                  router.refresh();
+                } finally {
+                  setIsSwitchingRole(false);
+                }
+              }}
+              className="inline-block px-6 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
+            >
+              {isSwitchingRole ? 'Switching...' : 'Switch to Buyer'}
+            </button>
+          ) : (
+            <a href="/login" className="inline-block px-6 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors">
+              Use Buyer Account
+            </a>
+          )}
         </div>
       )}
 

@@ -31,16 +31,23 @@ cron.schedule('*/5 * * * * *', async () => {
       const result = await auctionService.endAuction(row.id);
       if (!result) continue;
 
-      stopAuctionTick(row.id);
+      if (typeof stopAuctionTick === 'function') {
+        stopAuctionTick(row.id);
+      }
       console.log(`🔴 Auction ended: ${row.id}`);
 
       try {
         const io = getIO();
-        io.to(`auction:${row.id}`).emit('auction_ended', {
+        const payload = {
           winner_id: result.winner?.bidder_id || null,
           final_price: result.winner?.amount || null,
           item_title: result.auction.item_title,
-        });
+        };
+
+        // Primary legacy room currently used by connected clients.
+        io.to(`auction_${row.id}`).emit('auction_ended', payload);
+        // Compatibility emit for alternate room naming.
+        io.to(`auction:${row.id}`).emit('auction_ended', payload);
       } catch {}
 
       // Notify winner

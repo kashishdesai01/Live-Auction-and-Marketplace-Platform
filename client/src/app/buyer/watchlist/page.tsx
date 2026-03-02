@@ -79,7 +79,10 @@ export default function WatchlistPage() {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
           {filteredWatchlist.map((auction: any) => (
-            <AuctionCard key={auction.id} auction={auction} />
+            <AuctionCard
+              key={auction.id || auction.auction_id}
+              auction={{ ...auction, id: auction.id || auction.auction_id }}
+            />
           ))}
         </div>
       )}

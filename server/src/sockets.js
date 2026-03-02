@@ -48,5 +48,10 @@ module.exports = {
       throw new Error('Socket.io has not been initialized!');
     }
     return io;
-  }
+  },
+
+  // Compatibility helpers for cron job imports.
+  startAuctionTick: () => {},
+
+  stopAuctionTick: () => {},
 };

@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const redis = require('../config/redis');
 const { AppError } = require('../middleware/error');
+const { getOrderSchema } = require('./orderSchema');
 
 async function createAuction(sellerId, { item_id, start_time, end_time, bid_increment }) {
   // Verify item ownership and availability
@@ -92,6 +93,10 @@ async function placeBid(auctionId, bidderId, amount, idempotencyKey) {
       [auctionId]
     );
     const prevHighBidder = prevBids[0]?.bidder_id;
+    if (prevHighBidder === bidderId) {
+      await client.query('ROLLBACK');
+      return { accepted: false, reason: 'already_highest' };
+    }
 
     // Update auction price
     await client.query(
@@ -250,10 +255,19 @@ async function endAuction(auctionId) {
         }
       }
 
+      const { statusColumn, hasStripePaymentIntentId } = await getOrderSchema(client);
+      const orderColumns = ['auction_id', 'buyer_id', 'seller_id', 'amount', statusColumn];
+      const orderValues = [auctionId, winner.bidder_id, sellerId, winner.amount, paymentIntentId ? 'paid' : 'pending'];
+
+      if (hasStripePaymentIntentId) {
+        orderColumns.push('stripe_payment_intent_id');
+        orderValues.push(paymentIntentId);
+      }
+
+      const placeholders = orderColumns.map((_, idx) => `$${idx + 1}`).join(',');
       const { rows: orderRows } = await client.query(
-        `INSERT INTO orders (auction_id, buyer_id, seller_id, amount, status)
-         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-        [auctionId, winner.bidder_id, sellerId, winner.amount, paymentIntentId ? 'paid' : 'pending']
+        `INSERT INTO orders (${orderColumns.join(',')}) VALUES (${placeholders}) RETURNING *`,
+        orderValues
       );
       order = orderRows[0];
     }

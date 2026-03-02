@@ -5,14 +5,35 @@ import api from '@/lib/api';
 import Link from 'next/link';
 import { Gavel, ExternalLink, Clock } from 'lucide-react';
 import { format } from 'date-fns';
+import type { AxiosError } from 'axios';
+import { useAuth } from '@/contexts/AuthContext';
+
+type BidRecord = {
+  id: string;
+  auction_id: string;
+  amount: number | string;
+  status: string;
+  placed_at: string;
+  item_title: string;
+  item_image?: string | null;
+};
+
+type ApiErrorPayload = {
+  error?: {
+    message?: string;
+    code?: string;
+  };
+};
 
 export default function BuyerBidsPage() {
-  const { data: bids = [], isLoading } = useQuery({
-    queryKey: ['buyer-bids'],
+  const { user, isAuthenticated } = useAuth();
+  const { data: bids = [], isLoading, isError, error } = useQuery<BidRecord[], AxiosError<ApiErrorPayload>>({
+    queryKey: ['buyer-bids', user?.id],
     queryFn: async () => {
       const { data } = await api.get('/buyer/bids');
-      return data.bids;
+      return data.bids || [];
     },
+    enabled: isAuthenticated,
   });
 
   return (
@@ -48,6 +69,24 @@ export default function BuyerBidsPage() {
                      <td className="px-6 py-4 text-right"><div className="h-8 bg-white/5 rounded w-24 ml-auto"></div></td>
                   </tr>
                 ))
+              ) : !isAuthenticated ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">
+                    <p>Please log in as a buyer to view bids.</p>
+                    <Link href="/login" className="text-primary mt-2 inline-block hover:underline">
+                      Go to Login
+                    </Link>
+                  </td>
+                </tr>
+              ) : isError ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center text-amber-300">
+                    <p className="font-medium">Could not load bid history.</p>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      {error?.response?.data?.error?.message || 'Request failed. Please refresh and try again.'}
+                    </p>
+                  </td>
+                </tr>
               ) : bids.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">
@@ -59,7 +98,7 @@ export default function BuyerBidsPage() {
                   </td>
                 </tr>
               ) : (
-                bids.map((bid: any) => (
+                bids.map((bid) => (
                   <tr key={bid.id} className="hover:bg-white/5 transition-colors group">
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-3 w-max">

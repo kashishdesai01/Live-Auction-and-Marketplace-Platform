@@ -11,7 +11,8 @@
     "dev:client": "npm run dev --workspace=client",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "migrate": "npm run migrate --workspace=server",
-    "seed": "npm run seed --workspace=server"
+    "seed": "npm run seed --workspace=server",
+    "seed:demo": "npm run seed:demo --workspace=server"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

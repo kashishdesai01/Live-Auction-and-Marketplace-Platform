@@ -8,3 +8,5 @@ dist/
 *.log
 .vercel/
 coverage/
+Original_Implementation_Spec.md
+.env.example

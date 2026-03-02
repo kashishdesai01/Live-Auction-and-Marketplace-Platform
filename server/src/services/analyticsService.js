@@ -1,10 +1,13 @@
 const pool = require('../config/db');
+const { getOrderSchema } = require('./orderSchema');
 
 async function getDashboardMetrics(sellerId) {
+  const { statusColumn } = await getOrderSchema();
+
   const { rows } = await pool.query(
     `SELECT
-       COUNT(DISTINCT o.id) FILTER (WHERE o.payment_status='paid') as total_sales,
-       COALESCE(SUM(o.amount) FILTER (WHERE o.payment_status='paid'), 0) as total_revenue,
+       COUNT(DISTINCT o.id) FILTER (WHERE o.${statusColumn}='paid') as total_sales,
+       COALESCE(SUM(o.amount) FILTER (WHERE o.${statusColumn}='paid'), 0) as total_revenue,
        COUNT(DISTINCT a.id) FILTER (WHERE a.status='live') as active_auctions,
        COUNT(DISTINCT a.id) FILTER (WHERE a.status='ended') as ended_auctions,
        COUNT(DISTINCT a.id) FILTER (WHERE a.status='ended' AND a.winner_id IS NOT NULL) as sold_auctions,
@@ -32,6 +35,7 @@ async function getDashboardMetrics(sellerId) {
 }
 
 async function getAnalytics(sellerId, { range = '30d' } = {}) {
+  const { statusColumn } = await getOrderSchema();
   const days = range === '7d' ? 7 : range === '90d' ? 90 : 30;
 
   const { rows: revenueChart } = await pool.query(
@@ -39,7 +43,7 @@ async function getAnalytics(sellerId, { range = '30d' } = {}) {
      FROM orders o
      JOIN auctions a ON a.id=o.auction_id
      JOIN items i ON i.id=a.item_id
-     WHERE i.seller_id=$1 AND o.payment_status='paid'
+     WHERE i.seller_id=$1 AND o.${statusColumn}='paid'
        AND o.created_at >= NOW() - INTERVAL '${days} days'
      GROUP BY DATE(o.created_at)
      ORDER BY date`,
@@ -52,7 +56,7 @@ async function getAnalytics(sellerId, { range = '30d' } = {}) {
      JOIN auctions a ON a.id=o.auction_id
      JOIN items i ON i.id=a.item_id
      JOIN categories c ON c.id=i.category_id
-     WHERE i.seller_id=$1 AND o.payment_status='paid'
+     WHERE i.seller_id=$1 AND o.${statusColumn}='paid'
      GROUP BY c.name ORDER BY revenue DESC LIMIT 8`,
     [sellerId]
   );

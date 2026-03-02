@@ -1,18 +1,91 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import api from '@/lib/api';
 import Link from 'next/link';
-import { ShoppingBag, Search, ExternalLink, Trophy, Truck, ShieldCheck, ShieldAlert, Clock } from 'lucide-react';
+import { Trophy, Truck, ShieldCheck, ShieldAlert, Clock } from 'lucide-react';
 import { format } from 'date-fns';
+import type { AxiosError } from 'axios';
+import { useAuth } from '@/contexts/AuthContext';
+
+type PaymentMode = 'sandbox' | 'demo';
+type SandboxScenario = 'success' | 'decline' | 'auth';
+type PaymentStatus = 'pending' | 'paid' | 'failed' | string;
+
+type WinOrder = {
+  id: string;
+  amount: number | string;
+  created_at: string;
+  item_title: string;
+  item_image?: string | null;
+  seller_name?: string | null;
+  shipping_status?: string | null;
+  tracking_number?: string | null;
+  status?: PaymentStatus;
+  payment_status?: PaymentStatus;
+};
+
+type PayMutationInput = {
+  orderId: string;
+  mode: PaymentMode;
+  scenario: SandboxScenario;
+};
+
+type PayResponse = {
+  mode?: string;
+  paid?: boolean;
+  webhook_expected?: boolean;
+  error?: {
+    message?: string;
+  };
+};
+
+type ApiErrorPayload = {
+  error?: {
+    message?: string;
+  };
+};
 
 export default function BuyerWinsPage() {
-  const { data: wins = [], isLoading } = useQuery({
-    queryKey: ['buyer-wins'],
+  const { user, isAuthenticated } = useAuth();
+  const [payMessage, setPayMessage] = useState<string | null>(null);
+  const [paymentMode, setPaymentMode] = useState<PaymentMode>('sandbox');
+  const [sandboxScenario, setSandboxScenario] = useState<SandboxScenario>('success');
+  const { data: wins = [], isLoading, refetch, isError, error } = useQuery<WinOrder[], AxiosError<ApiErrorPayload>>({
+    queryKey: ['buyer-wins', user?.id],
     queryFn: async () => {
       const { data } = await api.get('/buyer/wins');
-      // Assume endpoint returns items won / orders created
-      return data.orders || [];
+      return data.wins || data.orders || [];
+    },
+    enabled: isAuthenticated,
+    refetchInterval: 4000,
+  });
+
+  const payOrder = useMutation<PayResponse, AxiosError<ApiErrorPayload>, PayMutationInput>({
+    mutationFn: async ({ orderId, mode, scenario }) => {
+      const params: Record<string, string> = { mode };
+      if (mode === 'sandbox') params.scenario = scenario;
+      const { data } = await api.post(`/buyer/orders/${orderId}/pay`, null, { params });
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (data?.error?.message) {
+        setPayMessage(data.error.message);
+      } else if (variables.mode === 'demo') {
+        setPayMessage('Payment completed in demo mode.');
+      } else if (data?.webhook_expected) {
+        setPayMessage('Payment initiated in Stripe sandbox. Status will update via webhook shortly.');
+      } else if (data?.paid) {
+        setPayMessage('Sandbox payment completed.');
+      } else {
+        setPayMessage('Payment initiated.');
+      }
+      refetch();
+    },
+    onError: (err) => {
+      setPayMessage(err?.response?.data?.error?.message || 'Payment failed. Please try again.');
+      refetch();
     },
   });
 
@@ -26,6 +99,35 @@ export default function BuyerWinsPage() {
           </h1>
           <p className="text-muted-foreground text-sm mt-1">Review your successful bids and track shipments</p>
         </div>
+      </div>
+
+      {payMessage && (
+        <div className="mb-4 p-3 rounded-lg text-sm bg-white/5 border border-white/10">
+          {payMessage}
+        </div>
+      )}
+
+      <div className="mb-4 p-3 rounded-lg border border-white/10 bg-white/5 flex flex-col sm:flex-row sm:items-center gap-3">
+        <div className="text-xs text-muted-foreground min-w-fit">Payment test mode</div>
+        <select
+          value={paymentMode}
+          onChange={(e) => setPaymentMode(e.target.value as PaymentMode)}
+          className="px-3 py-2 rounded-lg bg-black/20 border border-white/10 text-sm"
+        >
+          <option value="sandbox">Stripe Sandbox</option>
+          <option value="demo">Local Demo</option>
+        </select>
+        {paymentMode === 'sandbox' && (
+          <select
+            value={sandboxScenario}
+            onChange={(e) => setSandboxScenario(e.target.value as SandboxScenario)}
+            className="px-3 py-2 rounded-lg bg-black/20 border border-white/10 text-sm"
+          >
+            <option value="success">Success</option>
+            <option value="decline">Declined Card</option>
+            <option value="auth">3DS/Auth Required</option>
+          </select>
+        )}
       </div>
 
       <div className="glass-card rounded-2xl border border-white/5 overflow-hidden">
@@ -51,6 +153,24 @@ export default function BuyerWinsPage() {
                      <td className="px-6 py-4 text-right"><div className="h-8 bg-white/5 rounded w-24 ml-auto"></div></td>
                   </tr>
                 ))
+              ) : !isAuthenticated ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">
+                    <p>Please log in as a buyer to view wins.</p>
+                    <Link href="/login" className="text-primary mt-2 inline-block hover:underline">
+                      Go to Login
+                    </Link>
+                  </td>
+                </tr>
+              ) : isError ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center text-amber-300">
+                    <p className="font-medium">Could not load wins.</p>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      {error?.response?.data?.error?.message || 'Request failed. Please refresh and try again.'}
+                    </p>
+                  </td>
+                </tr>
               ) : wins.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">
@@ -62,7 +182,9 @@ export default function BuyerWinsPage() {
                   </td>
                 </tr>
               ) : (
-                wins.map((order: any) => (
+                wins.map((order) => {
+                  const paymentStatus = order.status || order.payment_status;
+                  return (
                   <tr key={order.id} className="hover:bg-white/5 transition-colors group">
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-4 max-w-sm">
@@ -94,19 +216,19 @@ export default function BuyerWinsPage() {
                     <td className="px-6 py-4">
                       <p className="font-bold text-foreground text-lg">${Number(order.amount).toFixed(2)}</p>
                       
-                      {order.status === 'paid' && (
+                      {paymentStatus === 'paid' && (
                         <div className="flex items-center gap-1 text-[10px] text-emerald-400 mt-0.5">
-                          <ShieldCheck className="w-3 h-3" /> Paid via Stripe
+                          <ShieldCheck className="w-3 h-3" /> Payment Confirmed
                         </div>
                       )}
-                      {order.status === 'failed' && (
+                      {paymentStatus === 'failed' && (
                         <div className="flex items-center gap-1 text-[10px] text-destructive mt-0.5">
                           <ShieldAlert className="w-3 h-3" /> Payment Failed
                         </div>
                       )}
-                      {order.status === 'pending' && (
-                        <div className="flex items-center gap-1 text-[10px] text-amber-500 mt-0.5 animate-pulse">
-                          <Clock className="w-3 h-3" /> Processing...
+                      {paymentStatus === 'pending' && (
+                        <div className="flex items-center gap-1 text-[10px] text-amber-500 mt-0.5">
+                          <Clock className="w-3 h-3" /> Payment Required
                         </div>
                       )}
                     </td>
@@ -131,12 +253,23 @@ export default function BuyerWinsPage() {
                     </td>
 
                     <td className="px-6 py-4 text-right">
-                      <button className="px-4 py-2 glass-card hover:bg-white/10 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-2 whitespace-nowrap">
-                        Order Details
-                      </button>
+                      {paymentStatus === 'paid' ? (
+                        <button className="px-4 py-2 glass-card text-xs font-medium rounded-lg inline-flex items-center gap-2 whitespace-nowrap opacity-70 cursor-default">
+                          Paid
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => payOrder.mutate({ orderId: order.id, mode: paymentMode, scenario: sandboxScenario })}
+                          disabled={payOrder.isPending && payOrder.variables?.orderId === order.id}
+                          className="px-4 py-2 bg-primary/20 text-primary hover:bg-primary hover:text-primary-foreground text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-2 whitespace-nowrap disabled:opacity-50"
+                        >
+                          {payOrder.isPending && payOrder.variables?.orderId === order.id ? 'Processing...' : 'Pay Now'}
+                        </button>
+                      )}
                     </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>
